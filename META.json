@@ -1,10 +1,10 @@
 {
-   "abstract" : "CGI-based Ext.Direct server",
+   "abstract" : "A tiny but capable pure Perl Ext.Direct server",
    "author" : [
-      "Alexander Tokarev <tokarev@cpan.org>"
+      "Alex Tokarev <tokarev@cpan.org>"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "ExtUtils::MakeMaker version 6.62, CPAN::Meta::Converter version 2.112150",
+   "generated_by" : "ExtUtils::MakeMaker version 6.98, CPAN::Meta::Converter version 2.140640",
    "license" : [
       "perl_5"
    ],
@@ -22,18 +22,20 @@
    "prereqs" : {
       "build" : {
          "requires" : {
-            "WWW::Mechanize" : 0
+            "HTTP::Tiny" : "0",
+            "Test::More" : "0"
          }
       },
       "configure" : {
          "requires" : {
-            "ExtUtils::MakeMaker" : 0
+            "ExtUtils::MakeMaker" : "0"
          }
       },
       "runtime" : {
          "requires" : {
-            "CGI::ExtDirect" : "1.12",
-            "RPC::ExtDirect" : "1.31"
+            "CGI::ExtDirect" : "3.00",
+            "HTTP::Server::Simple" : "0.44",
+            "RPC::ExtDirect" : "3.00"
          }
       }
    },
@@ -46,5 +48,5 @@
          "url" : "http://github.com/nohuhu/RPC-ExtDirect-Server"
       }
    },
-   "version" : "0.01"
+   "version" : "1.00"
 }

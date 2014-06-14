@@ -4,43 +4,72 @@ use strict;
 use warnings;
 no  warnings 'uninitialized';   ## no critic
 
-use HTTP::Date qw(str2time time2str);
-use CGI '-nph';
-use List::Util qw(first);
+use Carp;
 
-use RPC::ExtDirect::API     api_path    => '/api',
-                            router_path => '/router',
-                            poll_path   => '/events',
-                            ;
-
+use RPC::ExtDirect::Util::Accessor;
+use RPC::ExtDirect::Config;
+use RPC::ExtDirect::API;
+use RPC::ExtDirect;
 use CGI::ExtDirect;
 
+use HTTP::Server::Simple::CGI;
 use base 'HTTP::Server::Simple::CGI';
 
-### VERSION ###
-
-our $VERSION = '0.01';
-
-### PUBLIC PACKAGE VARIABLE ###
+### PACKAGE GLOBAL VARIABLE ###
 #
-# Turns debugging on and off
+# Version of this module.
 #
 
-our $DEBUG = 0;
+our $VERSION = '1.00';
 
-### PUBLIC PACKAGE VARIABLE ###
-#
-# Main dispatch table that matches URIs to methods
-#
+# We're trying hard not to depend on any non-core modules,
+# but there's no reason not to use them if they're available
+my ($have_http_date, $have_cgi_simple);
 
-our @DISPATCH = (
+{
+    local $@;
+    $have_http_date  = eval "require HTTP::Date";
+    $have_cgi_simple = eval "require CGI::Simple";
+}
 
-    # Format:
-#   { match => qr{URI}, code => \&method, },
+# We assume that HTTP::Date::time2str is better maintained,
+# so use it if we can. If HTTP::Date is not installed,
+# fall back to our own time2str - which was shamelessly copied
+# from HTTP::Date anyway.
+if ( $have_http_date ) {
+    *time2str = *HTTP::Date::time2str;
+    *str2time = *HTTP::Date::str2time;
+}
+else {
+    eval <<'END_SUB';
+    my @DoW = qw(Sun Mon Tue Wed Thu Fri Sat);
+    my @MoY = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    
+    sub time2str {
+        my $time = shift;
+        
+        $time = time unless defined $time;
+        
+        my ($sec, $min, $hour, $mday, $mon, $year, $wday)
+            = gmtime($time);
+        
+        return sprintf "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                       $DoW[$wday],
+                       $mday,
+                       $MoY[$mon],
+                       $year + 1900,
+                       $hour,
+                       $min,
+                       $sec
+                       ;
+    }
+END_SUB
+}
 
-    { match => qr{^/api},    code => \&handle_extdirect_api    },
-    { match => qr{^/router}, code => \&handle_extdirect_router },
-    { match => qr{^/events}, code => \&handle_extdirect_events },
+my %DEFAULTS = (
+    index_file    => 'index.html',
+    expires_after => 259200, # 3 days in seconds
+    buffer_size   => 262144, # 256kb in bytes
 );
 
 ### PUBLIC CLASS METHOD (CONSTRUCTOR) ###
@@ -49,218 +78,78 @@ our @DISPATCH = (
 #
 
 sub new {
-    my ($class, %params) = @_;
+    my ($class, %arg) = @_;
 
-    my $host       = $params{host};
-    my $static_dir = $params{static_dir};
+    my $api        = delete $arg{api}        || RPC::ExtDirect->get_api();
+    my $config     = delete $arg{config}     || $api->config;
+    my $host       = delete $arg{host}       || '127.0.0.1';
+    my $port       = delete $arg{port}       || 8080;
+    my $cust_disp  = delete $arg{dispatch}   || [];
+    my $static_dir = delete $arg{static_dir} || '/tmp';
+    my $cgi_class  = delete $arg{cgi_class};
 
-    die "Static directory is required parameter, stopped\n"
-        unless defined $static_dir;
-
-    # We generate random port here to avoid clashing in parallel testing
-    my $port = $params{port} // 30000 + int rand 9999;
-
-    logit("New HTTPServer with port $port on localhost");
+    $config->set_options(%arg);
 
     my $self = $class->SUPER::new($port);
+    
+    $self->_init_cgi_class($cgi_class);
+    
+    $self->api($api);
+    $self->config($config);
+    $self->host($host);
 
-    # Host is always localhost for testing, except when overridden
-    $self->host( $host // '127.0.0.1' );
+    $self->static_dir($static_dir);
+    $self->logit("Using static directory ". $self->static_dir);
+    
+    while ( my ($k, $v) = each %DEFAULTS ) {
+        my $value = exists $arg{ $k } ? delete $arg{ $k } : $v;
+        
+        $self->$k($value);
+    }
 
-    $self->{static_dir} = $static_dir;
-
-    logit("Using static directory ". $self->static_dir);
-
+    $self->_init_dispatch($cust_disp);
+    
     return bless $self, $class;
 }
 
 ### PUBLIC INSTANCE METHOD ###
 #
-# Parse HTTP request line. Returns three values: request method,
-# URI and protocol.
-#
-
-sub parse_request {
-    $_ = <STDIN> // return;
-
-    /^(\w+)\s+(\S+)(?:\s+(\S+))?\r?$/ and
-        return ($1 // '', $2 // '', $3 // '');
-}
-
-### PUBLIC INSTANCE METHOD ###
-#
-# Parse incoming HTTP headers from STDIN and return arrayref of
-# header/value pairs.
-#
-
-sub parse_headers {
-    my @headers;
-
-    while ( <STDIN> ) {
-        s/[\r\l\n\s]+$//;
-        last if /^$/;
-
-        push @headers, $1 => $2
-            if /^([^()<>\@,;:\\"\/\[\]?={} \t]+):\s*(.*)/i;
-    };
-
-    return \@headers;
-}
-
-### PUBLIC INSTANCE METHOD ###
-#
 # Find matching method by URI and dispatch it.
+# This is an entry point for HTTP::Server::Simple API, and is called
+# by the underlying module (in fact HTTP::Server::Simple::CGI).
 #
 
 sub handle_request {
     my ($self, $cgi) = @_;
-
-    $cgi->nph(1);
-    $self->{cgi} = $cgi;
-
+    
     my $path_info = $cgi->path_info();
+    
+    my $debug = $self->config->debug;
+    
+    $self->logit("Handling request: $path_info") if $debug;
+    
+    $cgi->nph(1);
+    
+    HANDLER:
+    for my $handler ( @{ $self->dispatch } ) {
+        my $match = $handler->{match};
+        
+        $self->logit("Matching '$path_info' against $match") if $debug;
+        
+        next HANDLER unless $path_info =~ $match;
+        
+        $self->logit("Got specific handler with match '$match'") if $debug;
+        
+        my $code = $handler->{code};
+        
+        # Handlers are always called as if they were ref($self)
+        # instance methods
+        return $code->($self, $cgi);
+    }
 
-    logit("Handling request: $path_info");
-
-    my ($handler, $match)
-        = map   { $_? ( $_->{code}, $_->{match} ) : () }
-          first { $path_info =~ $_->{match}            }
-                @DISPATCH
-        ;
-
-    logit("Got handler with match $match") if $handler;
-
-    return $handler ? $handler->($self, $cgi)
-         :            $self->handle_default($cgi)
-         ;
-}
-
-### PUBLIC INSTANCE METHOD ###
-#
-# Return 404 header without a body.
-#
-
-sub handle_404 {
-    my ($self, $cgi, $url) = @_;
-
-    $cgi //= $self->cgi;
-
-    logit("Handling 404");
-
-    print $cgi->header(-status => '404 Not Found', -charset => 'utf-8');
-
-    return 1;
-}
-
-### PUBLIC INSTANCE METHOD ###
-#
-# Return 500 header and message body.
-#
-
-sub handle_500 {
-    my ($self, $cgi, $msg) = @_;
-
-    $cgi //= $self->cgi;
-
-    logit("Handling 500");
-
-    print $cgi->header(-status  => '500 Internal Server Error',
-                       -charset => 'utf-8');
-
-    my $msg_p = $msg ? "<br /><p>Error message: $msg</p>"
-              :        "<br /><p></p>"
-              ;
-
-    print <<"END_HTML";
-<html><head><title>Internal Server Error</title></head>
-<body>
-<p>We're terribly sorry but server was unable to process your request
-due to internal error.</p>
-<p>The error was not caused by your actions, it is probably a bug or
-misconfiguration in the software.</p>
-<p>If you don't mind helping to fix this error, please tell your system
-administrator about it.</p>
-$msg_p
-</body>
-</html>
-END_HTML
-
-    return 1;
-}
-
-### PUBLIC INSTANCE METHOD ###
-#
-# Handle static content
-#
-
-my %MIME_TYPES = (
-    'css'   => 'text/css',
-    'txt'   => 'text/plain',
-    'htm'   => 'text/html',
-    'html'  => 'text/html',
-    'ico'   => 'image/x-icon',
-    'gif'   => 'image/gif',
-    'jpg'   => 'image/jpeg',
-    'jpeg'  => 'image/jpeg',
-    'png'   => 'image/png',
-    'js'    => 'text/javascript',
-    'json'  => 'application/json',
-    'swf'   => 'application/x-shockwave-flash',
-);
-
-sub handle_static {
-    my ($self, %params) = @_;
-
-    my $cgi = $self->cgi;
-
-    my $file_name = $params{file_name};
-    my $mime      = $params{mime};
-
-    logit("Handling static request for $file_name");
-
-    my ($fino, $fsize, $fmtime) = (stat $file_name)[1, 7, 9];
-    $self->handle_404() unless $fino;
-
-    my $suff;
-    $file_name =~ /.*\.(\w+)$/ and $suff = $1;
-
-    my $type = $mime // $MIME_TYPES{$suff} // 'application/octet-stream';
-
-    logit("Got MIME type $type");
-
-    my $ims = $cgi->http('If-Modified-Since');
-    if ( $ims && $fmtime <= str2time($ims) )
-    {
-        logit("File has not changed, serving 304");
-        print $cgi->header(-type => $type, -status => '304 Not Modified');
-        return 1;
-    };
-
-    my ($in, $out, $rd, $buf);
-
-    if ( not open $in, '<', $file_name ) {
-        logit("File is unreadable, serving 403");
-        print $cgi->header(-status => '403 Forbidden');
-        return 1;
-    };
-
-    logit("Serving file content with 200");
-
-    print $cgi->header(-type => $type, -status => '200 OK',
-                       -charset => ($type !~ /image|octet/ ? 'utf-8' : ''),
-                       -Expires => time2str(time + 259200), # 3 days
-                       -Content_Length => $fsize,
-                       -Last_Modified => time2str($fmtime));
-
-    binmode $in;
-
-    $out = select;
-    binmode $out;
-
-    # Reasonably large buffer?
-    syswrite $out, $buf, $rd while $rd = sysread $in, $buf, 262144;
-
-    return 1;
+    $self->logit("No specific handlers found, serving default") if $debug;
+    
+    return $self->handle_default($cgi, $path_info);
 }
 
 ### PUBLIC INSTANCE METHOD ###
@@ -269,41 +158,141 @@ sub handle_static {
 #
 
 sub handle_default {
-    my ($self, $cgi) = @_;
-
-    $cgi //= $self->cgi;
-
-    my $path = $cgi->path_info();
+    my ($self, $cgi, $path) = @_;
 
     # Lame security measure
-    $self->handle_404() if $path =~ m{^\.{1,2}/};
+    return $self->handle_403($cgi, $path) if $path =~ m{/\.\.};
 
     my $static = $self->static_dir();
     $static   .= '/' unless $path =~ m{^/};
 
     my $file_name = $static . $path;
+    
+    my $file_exists   = -f $file_name;
+    my $file_readable = -r $file_name;
 
     if ( -d $file_name ) {
-
-        # Directory requested, redirecting to index.html
-        $path =~ s{/$}{};
-
-        logit("Got directory, redirecting to $path/index.html");
-
-        print $cgi->redirect(-uri    => "$path/index.html",
-                             -status => '301 Moved Permanently');
+        $self->logit("Got directory request");
+        return $self->handle_directory($cgi, $path);
     }
-    elsif ( -f $file_name && -r $file_name ) {
-
-        # Got readable file, serving it as static content
-        logit("Got readable file, serving as static content");
-        $self->handle_static(file_name => $file_name );
+    elsif ( $file_exists && !$file_readable ) {
+        $self->logit("File exists but no permissions to read it (403)");
+        return $self->handle_403($cgi, $path);
+    }
+    elsif ( $file_exists && $file_readable ) {
+        $self->logit("Got readable file, serving as static content");
+        return $self->handle_static(
+            cgi       => $cgi,
+            file_name => $file_name,
+        );
     }
     else {
-        $self->handle_404();
+        return $self->handle_404($cgi, $path);
     };
 
-    return 1;   # Just in case
+    return 1;
+}
+
+### PUBLIC INSTANCE METHOD ###
+#
+# Handle directory request. Usually results in a redirect
+# but can be overridden to do something fancier.
+#
+
+sub handle_directory {
+    my ($self, $cgi, $path) = @_;
+    
+    # Directory requested, redirecting to index.html
+    $path =~ s{/+$}{};
+    
+    my $index_file = $self->index_file;
+    
+    $self->logit("Redirecting to $path/$index_file");
+    
+    my $out = $self->stdio_handle;
+
+    print $out $cgi->redirect(
+        -uri    => "$path/$index_file",
+        -status => '301 Moved Permanently'
+    );
+    
+    return 1;
+}
+
+### PUBLIC INSTANCE METHOD ###
+#
+# Handle static content
+#
+
+sub handle_static {
+    my ($self, %arg) = @_;
+
+    my $cgi       = $arg{cgi};
+    my $file_name = $arg{file_name};
+
+    $self->logit("Handling static request for $file_name");
+
+    my ($fino, $fsize, $fmtime) = (stat $file_name)[1, 7, 9];
+    return $self->handle_404() unless $fino;
+
+    my ($type, $charset) = $self->_guess_mime_type($file_name);
+    
+    $self->logit("Got MIME type $type");
+    
+    my $out = $self->stdio_handle;
+    
+    # We're only processing If-Modified-Since if HTTP::Date is installed.
+    # That's because str2time is not trivial and there's no point in
+    # copying that much code. The feature is not worth it.
+    if ( $have_http_date ) {
+        my $ims = $cgi->http('If-Modified-Since');
+    
+        if ( $ims && $fmtime <= str2time($ims) ) {
+            $self->logit("File has not changed, serving 304");
+            print $out $cgi->header(
+                -type   => $type,
+                -status => '304 Not Modified',
+            );
+        
+            return 1;
+        };
+    }
+    
+    my ($in, $buf);
+
+    if ( not open $in, '<', $file_name ) {
+        $self->logit("File is unreadable, serving 403");
+        return $self->handle_403($cgi);
+    };
+
+    $self->logit("Serving file content with 200");
+    
+    my $expires = $self->expires_after;
+
+    print $out $cgi->header(
+        -type    => $type,
+        -status  => '200 OK',
+        -charset => ($charset || ($type !~ /image|octet/ ? 'utf-8' : '')),
+        ( $expires ? ( -Expires => time2str(time + $expires) ) : () ),
+        -Content_Length => $fsize,
+        -Last_Modified  => time2str($fmtime),
+    );
+
+    my $bufsize = $self->buffer_size;
+    
+    binmode $in;
+    binmode $out;
+    
+    # Making the out handle hot helps in older Perls
+    {
+        my $orig_fh = select $out;
+        $| = 1;
+        select $orig_fh;
+    }
+
+    print $out $buf while sysread $in, $buf, $bufsize;
+
+    return 1;
 }
 
 ### PUBLIC INSTANCE METHOD ###
@@ -314,9 +303,7 @@ sub handle_default {
 sub handle_extdirect_api {
     my ($self, $cgi) = @_;
 
-    $cgi //= $self->cgi;
-
-    logit("Got Ext.Direct API request");
+    $self->logit("Got Ext.Direct API request");
 
     return $self->_handle_extdirect($cgi, 'api');
 }
@@ -329,9 +316,7 @@ sub handle_extdirect_api {
 sub handle_extdirect_router {
     my ($self, $cgi) = @_;
 
-    $cgi //= $self->cgi;
-
-    logit("Got Ext.Direct route request");
+    $self->logit("Got Ext.Direct route request");
 
     return $self->_handle_extdirect($cgi, 'route');
 }
@@ -341,30 +326,58 @@ sub handle_extdirect_router {
 # Poll Ext.Direct event providers for events
 #
 
-sub handle_extdirect_events {
+sub handle_extdirect_poll {
     my ($self, $cgi) = @_;
 
-    $cgi //= $self->cgi;
-
-    logit("Got Ext.Direct event poll request");
+    $self->logit("Got Ext.Direct event poll request");
 
     return $self->_handle_extdirect($cgi, 'poll');
 }
 
-### PUBLIC INSTANCE METHODS ###
+### PUBLIC INSTANCE METHOD ###
 #
-# Read only getters
-#
-
-sub cgi        { $_[0]->{cgi}        }
-sub static_dir { $_[0]->{static_dir} }
-
-### PUBLIC PACKAGE SUBROUTINE ###
-#
-# Helper method
+# Return 403 header without a body.
 #
 
-sub logit { print STDERR @_ if $DEBUG }
+sub handle_403 {
+    my ($self, $cgi, $uri) = @_;
+    
+    $self->logit("Handling 403 for URI $uri");
+    
+    my $out = $self->stdio_handle;
+    
+    print $out $cgi->header(-status => '403 Forbidden');
+    
+    return 1;
+}
+
+### PUBLIC INSTANCE METHOD ###
+#
+# Return 404 header without a body.
+#
+
+sub handle_404 {
+    my ($self, $cgi, $uri) = @_;
+
+    $self->logit("Handling 404 for URI $uri");
+    
+    my $out = $self->stdio_handle;
+
+    print $out $cgi->header(-status => '404 Not Found');
+
+    return 1;
+}
+
+### PUBLIC INSTANCE METHOD ###
+#
+# Log debugging info to STDERR
+#
+
+sub logit {
+    my $self = shift;
+    
+    print STDERR @_, "\n" if $self->config->debug;
+}
 
 ### PUBLIC PACKAGE SUBROUTINE ###
 #
@@ -372,120 +385,272 @@ sub logit { print STDERR @_ if $DEBUG }
 #
 
 sub print_banner {
-    my ($self) = @_;
+    my $self = shift;
 
-    $self->SUPER::print_banner if $DEBUG;
+    $self->SUPER::print_banner if $self->config->debug;
 }
+
+### PUBLIC INSTANCE METHODS ###
+#
+# Read-write accessors
+#
+
+RPC::ExtDirect::Util::Accessor->mk_accessors(
+    simple => [qw/
+        api
+        config
+        dispatch
+        static_dir
+        index_file
+        expires_after
+        buffer_size
+    /],
+);
 
 ############## PRIVATE METHODS BELOW ##############
 
 ### PRIVATE INSTANCE METHOD ###
 #
-# Do actual heavy lifting for Ext.Direct calls
+# Parse HTTP request line. Returns three values: request method,
+# URI and protocol.
+#
+# This method is overridden to improve parsing speed. The original
+# method is reading characters from STDIN one by one, which
+# results in abysmal performance. Not sure what was the intent
+# there but I haven't encountered any problems so far with the
+# faster implementation below.
+#
+# The same is applicable to the parse_headers() below.
+#
+
+sub parse_request {
+    my $self = shift;
+
+    my $io_handle = $self->stdio_handle;
+    my $input     = <$io_handle>;
+
+    return unless $input;
+
+    $input =~ /^(\w+)\s+(\S+)(?:\s+(\S+))?\r?$/ and
+        return ( $1.'', $2.'', $3.'' );
+}
+
+### PRIVATE INSTANCE METHOD ###
+#
+# Parse incoming HTTP headers from input file handle and return
+# an arrayref of header/value pairs.
+#
+
+sub parse_headers {
+    my $self = shift;
+
+    my $io_handle = $self->stdio_handle;
+
+    my @headers;
+
+    while ( my $input = <$io_handle> ) {
+        $input =~ s/[\r\l\n\s]+$//;
+        last if !$input;
+
+        push @headers, $1 => $2
+            if $input =~ /^([^()<>\@,;:\\"\/\[\]?={} \t]+):\s*(.*)/i;
+    };
+
+    return \@headers;
+}
+
+### PRIVATE INSTANCE METHOD ###
+#
+# Initialize CGI class. Used by constructor.
+#
+
+sub _init_cgi_class {
+    my ($self, $cgi_class) = @_;
+    
+    # Default to CGI::Simple > 1.113 if it's available, unless the user
+    # overrode cgi_class to do something else. CGI::Simple 1.113 and
+    # earlier has a bug with form/multipart file upload handling, so
+    # we don't use it even if it is installed.
+    if ( $cgi_class ) {
+        $self->cgi_class($cgi_class);
+        
+        if ( $cgi_class eq 'CGI' ) {
+            $self->cgi_init(sub {
+                local $@;
+                
+                eval {
+                    require CGI;
+                    CGI::initialize_globals();
+                }
+            });
+        }
+        else {
+            $self->cgi_init(sub {
+                eval "require $cgi_class";
+            });
+        }
+    }
+    elsif ( $have_cgi_simple && $CGI::Simple::VERSION > 1.113 &&
+            $self->cgi_class eq 'CGI' )
+    {
+        $self->cgi_class('CGI::Simple');
+        $self->cgi_init(undef);
+    }
+}
+
+### PRIVATE INSTANCE METHOD ###
+#
+# Initialize dispatch table. Used by constructor.
+#
+
+sub _init_dispatch {
+    my ($self, $cust_disp) = @_;
+    
+    my $config = $self->config;
+    
+    my @dispatch;
+
+    # Set the custom handlers so they would come first served.
+    # Format:
+    # [ qr{URI} => \&method, ... ]
+    # [ { match => qr{URI}, code => \&method, } ]
+    while ( my $uri = shift @$cust_disp ) {
+        $self->logit("Installing custom handler for URI: $uri");
+        push @dispatch, {
+            match => qr{$uri},
+            code  => shift @$cust_disp,
+        };
+    };
+    
+    # The default Ext.Direct handlers always come last
+    for my $type ( qw/ api router poll / ) {
+        my $uri_getter = "${type}_path";
+        my $handler    = "handle_extdirect_${type}";
+        my $uri        = $config->$uri_getter;
+        
+        if ( $uri ) {
+            push @dispatch, {
+                match => qr/^\Q$uri\E$/, code => \&{ $handler },
+            }
+        }
+    }
+
+    $self->dispatch(\@dispatch);
+}
+
+### PRIVATE INSTANCE METHOD ###
+#
+# Do the actual heavy lifting for Ext.Direct calls
 #
 
 sub _handle_extdirect {
     my ($self, $cgi, $what) = @_;
 
-    my $exd = CGI::ExtDirect->new({ cgi => $cgi, debug => 1});
+    my $exd = CGI::ExtDirect->new({
+        api    => $self->api,
+        config => $self->config,
+        cgi    => $cgi,
+    });
 
     # Standard CGI headers for this handler
-    my %std_cgi = ( nph => 1, '-charset' => 'utf-8' );
+    my %std_cgi = ( '-nph' => 1, '-charset' => 'utf-8' );
+    
+    my $out = $self->stdio_handle;
 
-    print $exd->$what( %std_cgi );
+    print $out $exd->$what( %std_cgi );
 
     return 1;
 }
 
+# Popular MIME types, taken from http://lwp.interglacial.com/appc_01.htm
+my %MIME_TYPES = (
+    au   => 'audio/basic',
+    avi  => 'vide/avi',
+    bmp  => 'image/bmp',
+    bz2  => 'application/x-bzip2',
+    css  => 'text/css',
+    dtd  => 'application/xml-dtd',
+    doc  => 'application/msword',
+    gif  => 'image/gif',
+    gz   => 'application/x-gzip',
+    ico  => 'image/x-icon',
+    hqx  => 'application/mac-binhex40',
+    htm  => 'text/html',
+    html => 'text/html',
+    jar  => 'application/java-archive',
+    jpg  => 'image/jpeg',
+    jpeg => 'image/jpeg',
+    js   => 'text/javascript',
+    json => 'application/json',
+    midi => 'audio/x-midi',
+    mp3  => 'audio/mpeg',
+    mpeg => 'video/mpeg',
+    ogg  => 'audio/vorbis',
+    pdf  => 'application/pdf',
+    pl   => 'application/x-perl',
+    png  => 'image/png',
+    ppt  => 'application/vnd.ms-powerpoint',
+    ps   => 'application/postscript',
+    qt   => 'video/quicktime',
+    rdf  => 'application/rdf',
+    rtf  => 'application/rtf',
+    sgml => 'text/sgml',
+    sit  => 'application/x-stuffit',
+    svg  => 'image/svg+xml',
+    swf  => 'application/x-shockwave-flash',
+    tgz  => 'application/x-tar',
+    tiff => 'image/tiff',
+    tsv  => 'text/tab-separated-values',
+    txt  => 'text/plain',
+    wav  => 'audio/wav',
+    xls  => 'application/excel',
+    xml  => 'application/xml',
+    zip  => 'application/zip',
+);
+
+### PRIVATE INSTANCE METHOD ###
+#
+# Return the guessed MIME type for a file name
+#
+
+# We try to use File::LibMagic or File::MimeInfo if available
+{
+    local $@;
+    
+    my $have_libmagic = $ENV{DEBUG_NO_FILE_LIBMAGIC}
+                      ? !1
+                      : eval "require File::LibMagic";
+    
+    my $have_mimeinfo = $ENV{DEBUG_NO_FILE_MIMEINFO}
+                      ? !1
+                      : eval "require File::MimeInfo";
+    
+    sub _guess_mime_type {
+        my ($self, $file_name) = @_;
+        
+        my ($type, $charset);
+        
+        if ( $have_libmagic ) {
+            my $magic = File::LibMagic->new();
+            my $mime = $magic->checktype_filename($file_name);
+            
+            ($type, $charset) = $mime =~ m{^([^;]+);\s*charset=(.*)$};
+        }
+        elsif ( $have_mimeinfo ) {
+            my $mimeinfo = File::MimeInfo->new();
+            $type = $mimeinfo->mimetype($file_name);
+        }
+        
+        # If none of the advanced modules are present, resort to
+        # guesstimating by file extension
+        else {
+            my ($suffix) = $file_name =~ /.*\.(\w+)$/;
+            
+            $type = $MIME_TYPES{ $suffix };
+        }
+        
+        return ($type || 'application/octet-stream', $charset);
+    }
+}
+
 1;
-
-__END__
-
-=pod
-
-=head1 NAME
-
-RPC::ExtDirect::Server - CGI-based Ext.Direct server
-
-=head1 SYNOPSIS
-
- use RPC::ExtDirect::Server;
- 
- my $server = RPC::ExtDirect::Server->new(static_dir => 'htdocs');
- my $port   = $server->port;
- 
- print "Ext.Direct server is running on port $port\n";
- 
- $server->run();
-
-=head1 DESCRIPTION
-
-This module implements a minimal Ext.Direct capable server in pure Perl.
-Its main purpose it to be used as lightweight drop-in replacement for
-more complex production environments like Plack or Apache/mod_perl, i.e.
-for testing and mockups. It can also be used as the basis for production
-application servers when feature richness is not a requirement, or when
-resource consumption is of primary concern.
-
-=head1 METHODS
-
-=over 4
-
-=item new(%params)
-
-Create a new server instance with specified parameters:
-
-=over 8
-
-=item host
-
-Hostname or IP address to bind to. Defaults to 127.0.0.1.
-
-=item port
-
-Port to bind to. Defaults to randomly generated in 30000-40000 range.
-
-=item static_dir
-
-Path to directory with static content. This parameter is mandatory.
-
-=back
-
-=item run
-
-Run the server. This method never returns.
-
-=back
-
-=head1 DEPENDENCIES
-
-RPC::ExtDirect::Server depends on the following modules:
-L<CGI::ExtDirect>, L<RPC::ExtDirect>, L<JSON>, L<Attribute::Handlers>.
-
-=head1 SEE ALSO
-
-For more information, see L<CGI::ExtDirect>.
-
-=head1 BUGS AND LIMITATIONS
-
-There are no known bugs in this module. Use github tracker to report bugs
-(the best way) or just drop me an e-mail. Patches are welcome.
-
-=head1 AUTHOR
-
-Alexander Tokarev E<lt>tokarev@cpan.orgE<gt>
-
-=head1 ACKNOWLEDGEMENTS
-
-I would like to thank IntelliSurvey, Inc for sponsoring my work
-on this module.
-
-=head1 COPYRIGHT AND LICENSE
-
-Copyright (c) 2012 Alexander Tokarev.
-
-This module is free software; you can redistribute it and/or modify it
-under the same terms as Perl itself. See L<perlartistic>.
-
-=cut
-
