@@ -484,7 +484,7 @@ default L<global API tree|RPC::ExtDirect::API/"GLOBAL API TREE INSTANCE">.
 
 =item C<config>
 
-Optional <LRPC::ExtDirect::Config> instance to be used. If not provided,
+Optional L<RPC::ExtDirect::Config> instance to be used. If not provided,
 the Config instance in the API object (either default or passed in L</api>
 parameter) will be used.
 
@@ -687,7 +687,7 @@ on this module.
 
 =head1 BUGS AND LIMITATIONS
 
-At this time There are no known bugs in this module. Please report
+At this time there are no known bugs in this module. Please report
 problems to the author, patches are always welcome.
 
 Use L<Github tracker|https://github.com/nohuhu/RPC-ExtDirect-Server/issues>

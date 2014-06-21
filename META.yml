@@ -3,8 +3,9 @@ abstract: 'A tiny but capable pure Perl Ext.Direct server'
 author:
   - 'Alex Tokarev <tokarev@cpan.org>'
 build_requires:
-  HTTP::Tiny: '0'
-  Test::More: '0'
+  ExtUtils::MakeMaker: '0'
+  HTTP::Tiny: '0.014'
+  Test::More: '0.82'
 configure_requires:
   ExtUtils::MakeMaker: '0'
 dynamic_config: 1
@@ -19,10 +20,11 @@ no_index:
     - t
     - inc
 requires:
-  CGI::ExtDirect: '3.00'
+  CGI::ExtDirect: '3.01'
   HTTP::Server::Simple: '0.44'
-  RPC::ExtDirect: '3.00'
+  RPC::ExtDirect: '3.01'
+  perl: '5.006'
 resources:
   bugtracker: http://github.com/nohuhu/RPC-ExtDirect-Server/issues
   repository: http://github.com/nohuhu/RPC-ExtDirect-Server
-version: '1.00'
+version: '1.01'
